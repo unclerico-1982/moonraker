@@ -16,16 +16,29 @@ from typing import (
     Optional,
     Dict,
     List,
+    Generic,
+    TypeVar
 )
+
 if TYPE_CHECKING:
     from ..confighelper import ConfigHelper
     from ..common import WebRequest
     from .database import MoonrakerDatabase as DBComp
     from .job_state import JobState
     from .file_manager.file_manager import FileManager
+    Totals = Dict[str, Union[float, int]]
 
+_T = TypeVar("_T")
 HIST_NAMESPACE = "history"
 MAX_JOBS = 10000
+BASE_TOTALS = {
+    "total_jobs": 0,
+    "total_time": 0.,
+    "total_print_time": 0.,
+    "total_filament_used": 0.,
+    "longest_job": 0.,
+    "longest_print": 0.
+}
 
 class History:
     def __init__(self, config: ConfigHelper) -> None:
@@ -33,17 +46,14 @@ class History:
         self.file_manager: FileManager = self.server.lookup_component(
             'file_manager')
         self.request_lock = Lock()
+        self.aux_fields: Dict[str, HistoryField] = {}
         database: DBComp = self.server.lookup_component("database")
-        self.job_totals: Dict[str, float] = database.get_item(
-            "moonraker", "history.job_totals",
-            {
-                'total_jobs': 0,
-                'total_time': 0.,
-                'total_print_time': 0.,
-                'total_filament_used': 0.,
-                'longest_job': 0.,
-                'longest_print': 0.
-            }).result()
+        self.job_totals: Totals = database.get_item(
+            "moonraker", "history.job_totals", dict(BASE_TOTALS)
+        ).result()
+        self.aux_totals: Totals = database.get_item(
+            "moonraker", "history.aux_totals", {}
+        ).result()
 
         self.server.register_event_handler(
             "server:klippy_disconnect", self._handle_disconnect)
@@ -66,6 +76,9 @@ class History:
         self.server.register_endpoint(
             "/server/history/reset_totals", RequestType.POST,
             self._handle_job_total_reset
+        )
+        self.server.register_endpoint(
+            "/server/history/info", RequestType.GET, self._handle_info_request
         )
 
         database.register_local_namespace(HIST_NAMESPACE)
@@ -165,30 +178,37 @@ class History:
 
             return {"count": count, "jobs": jobs}
 
-    async def _handle_job_totals(self,
-                                 web_request: WebRequest
-                                 ) -> Dict[str, Dict[str, float]]:
-        return {'job_totals': self.job_totals}
-
-    async def _handle_job_total_reset(self,
-                                      web_request: WebRequest,
-                                      ) -> Dict[str, Dict[str, float]]:
-        if self.current_job is not None:
-            raise self.server.error(
-                "Job in progress, cannot reset totals")
-        last_totals = dict(self.job_totals)
-        self.job_totals = {
-            'total_jobs': 0,
-            'total_time': 0.,
-            'total_print_time': 0.,
-            'total_filament_used': 0.,
-            'longest_job': 0.,
-            'longest_print': 0.
+    async def _handle_job_totals(self, web_request: WebRequest) -> Dict[str, Totals]:
+        return {
+            "job_totals": self.job_totals,
+            "auxiliary_totals": self.aux_totals
         }
+
+    async def _handle_job_total_reset(
+        self, web_request: WebRequest
+    ) -> Dict[str, Totals]:
+        if self.current_job is not None:
+            raise self.server.error("Job in progress, cannot reset totals")
+        last_totals = self.job_totals
+        self.job_totals = dict(BASE_TOTALS)
+        last_aux_totals = self.aux_totals
+        self.aux_totals = {}
+        for aux_field in self.aux_fields.values():
+            if aux_field.available_totals is not None:
+                self.aux_totals.update({key: 0 for key in aux_field.available_totals})
         database: DBComp = self.server.lookup_component("database")
-        await database.insert_item(
-            "moonraker", "history.job_totals", self.job_totals)
-        return {'last_totals': last_totals}
+        await database.insert_item("moonraker", "history.job_totals", self.job_totals)
+        await database.insert_item("moonraker", "history.job_totals", self.aux_totals)
+        return {
+            "last_totals": last_totals,
+            "last_auxiliary_totals": last_aux_totals
+        }
+
+    async def _handle_info_request(self, web_request: WebRequest) -> Dict[str, Any]:
+        aux_fields = [field.get_field_info() for field in self.aux_fields.values()]
+        return {
+            "auxiliary_fields": aux_fields
+        }
 
     def _on_job_state_changed(
         self,
@@ -227,6 +247,9 @@ class History:
         self.current_job = job
         self.current_job_id = job_id
         self.grab_job_metadata()
+        for aux_field in self.aux_fields.values():
+            value = aux_field.on_job_start()
+            job.set_auxiliary_data(aux_field.name, value)
         self.history_ns[job_id] = job.get_stats()
         self.cached_job_ids.append(job_id)
         self.next_job_id += 1
@@ -257,6 +280,9 @@ class History:
         self.current_job.finish(status, pstats)
         # Regrab metadata incase metadata wasn't parsed yet due to file upload
         self.grab_job_metadata()
+        for aux_field in self.aux_fields.values():
+            value = aux_field.on_job_finished()
+            self.current_job.set_auxiliary_data(aux_field.name, value)
         self.save_current_job()
         self._update_job_totals()
         logging.debug(
@@ -308,17 +334,30 @@ class History:
         if self.current_job is None:
             return
         job = self.current_job
-        self.job_totals['total_jobs'] += 1
-        self.job_totals['total_time'] += job.get('total_duration')
-        self.job_totals['total_print_time'] += job.get('print_duration')
-        self.job_totals['total_filament_used'] += job.get('filament_used')
-        self.job_totals['longest_job'] = max(
-            self.job_totals['longest_job'], job.get('total_duration'))
-        self.job_totals['longest_print'] = max(
-            self.job_totals['longest_print'], job.get('print_duration'))
+        self._accumulate_total("total_jobs", 1)
+        self._accumulate_total("total_time", job.total_duration)
+        self._accumulate_total("total_print_time", job.print_duration)
+        self._accumulate_total("total_filament_used", job.filament_used)
+        self._maximize_total("longest_job", job.total_duration)
+        self._maximize_total("longest_print", job.print_duration)
+        self._update_aux_totals()
         database: DBComp = self.server.lookup_component("database")
-        database.insert_item(
-            "moonraker", "history.job_totals", self.job_totals)
+        database.insert_item("moonraker", "history.job_totals", self.job_totals)
+        database.insert_item("moonraker", "history.aux_totals", self.aux_totals)
+
+    def _accumulate_total(self, field: str, val: Union[int, float]) -> None:
+        self.job_totals[field] += val
+
+    def _maximize_total(self, field: str, val: Union[int, float]) -> None:
+        self.job_totals[field] = max(self.job_totals[field], val)
+
+    def _update_aux_totals(self) -> None:
+        for aux_field in self.aux_fields.values():
+            if aux_field.available_totals is None:
+                continue
+            for field in aux_field.available_totals:
+                last_val = self.aux_totals.get(field, 0)
+                self.aux_totals[field] = aux_field.get_totals(field, last_val)
 
     def send_history_event(self, evt_action: str) -> None:
         if self.current_job is None or self.current_job_id is None:
@@ -339,6 +378,30 @@ class History:
         )
         return job
 
+    def register_auxiliary_field(
+        self, aux_field: HistoryField
+    ) -> None:
+        if aux_field.name in self.aux_fields:
+            raise self.server.error(
+                f"Field named '{aux_field.name}' already registered."
+            )
+        logging.debug(f"Registering auxiliary field: {aux_field.name}")
+        new_aux_totals = aux_field.available_totals
+        if new_aux_totals is not None:
+            registered_aux_totals = []
+            for hist_field in self.aux_fields.values():
+                if hist_field.available_totals is not None:
+                    registered_aux_totals.extend(hist_field.available_totals)
+            for new_aux_totals_field in new_aux_totals:
+                if new_aux_totals_field in registered_aux_totals:
+                    raise self.server.error(
+                        f"Auxiliary totals name '{new_aux_totals_field}' "
+                        "already registered."
+                    )
+                if new_aux_totals_field not in self.aux_totals:
+                    self.aux_totals[new_aux_totals_field] = 0
+        self.aux_fields[aux_field.name] = aux_field
+
     def on_exit(self) -> None:
         jstate: JobState = self.server.lookup_component("job_state")
         last_ps = jstate.get_last_stats()
@@ -354,6 +417,7 @@ class PrinterJob:
         self.status: str = "in_progress"
         self.start_time = time.time()
         self.total_duration: float = 0.
+        self.auxiliary_data: Dict[str, Any] = {}
         self.update_from_ps(data)
 
     def finish(self,
@@ -377,10 +441,53 @@ class PrinterJob:
             return
         setattr(self, name, val)
 
+    def set_auxiliary_data(self, field_name: str, val: Any) -> None:
+        self.auxiliary_data[field_name] = val
+
     def update_from_ps(self, data: Dict[str, Any]) -> None:
         for i in data:
             if hasattr(self, i):
                 setattr(self, i, data[i])
+
+class HistoryField(Generic[_T]):
+    def __init__(
+        self,
+        field_name: str,
+        units: Optional[str],
+        desc: str,
+        available_totals: Optional[List[str]] = None
+    ) -> None:
+        self._name = field_name
+        self.units = units
+        self.description = desc
+        self._available_totals = available_totals
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def available_totals(self) -> Optional[List[str]]:
+        return self._available_totals
+
+    def get_field_info(self) -> Dict[str, Any]:
+        return {
+            "name": self._name,
+            "units": self.units,
+            "description": self.description,
+            "available_totals": self._available_totals
+        }
+
+    def on_job_start(self) -> _T:
+        raise NotImplementedError
+
+    def on_job_finished(self) -> _T:
+        raise NotImplementedError
+
+    def get_totals(
+        self, field_name: str, last_total: Union[float, int]
+    ) -> Union[float, int]:
+        raise NotImplementedError
 
 def load_component(config: ConfigHelper) -> History:
     return History(config)
