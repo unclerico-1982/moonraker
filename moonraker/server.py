@@ -53,8 +53,8 @@ API_VERSION = (1, 4, 0)
 CORE_COMPONENTS = [
     'dbus_manager', 'database', 'file_manager', 'klippy_apis',
     'machine', 'data_store', 'shell_command', 'proc_stats',
-    'job_state', 'job_queue', 'http_client', 'announcements',
-    'webcam', 'extensions',
+    'job_state', 'job_queue', 'history', 'http_client',
+    'announcements', 'webcam', 'extensions',
 ]
 
 
