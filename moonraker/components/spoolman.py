@@ -8,15 +8,16 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
-from typing import TYPE_CHECKING, Dict, Any
+from typing import TYPE_CHECKING, Dict, Any, List, Optional
 from ..common import RequestType
+from .history import HistoryField
 
 if TYPE_CHECKING:
-    from typing import Optional
     from moonraker.websockets import WebRequest
     from moonraker.components.http_client import HttpClient
     from moonraker.components.database import MoonrakerDatabase
     from moonraker.components.announcements import Announcements
+    from .history import History
     from .klippy_apis import KlippyAPI as APIComp
     from confighelper import ConfigHelper
 
@@ -32,21 +33,18 @@ class SpoolManager:
 
     def __init__(self, config: ConfigHelper):
         self.server = config.get_server()
-
         self.sync_rate_seconds = config.getint("sync_rate", default=5, minval=1)
         self.last_sync_time = datetime.datetime.now()
         self.extruded_lock = asyncio.Lock()
         self.spoolman_url = f"{config.get('server').rstrip('/')}/api"
-
         self.klippy_apis: APIComp = self.server.lookup_component("klippy_apis")
-        self.http_client: HttpClient = self.server.lookup_component(
-            "http_client"
-        )
-        self.database: MoonrakerDatabase = self.server.lookup_component(
-            "database"
-        )
+        self.http_client: HttpClient = self.server.lookup_component("http_client")
+        self.database: MoonrakerDatabase = self.server.lookup_component("database")
         announcements: Announcements = self.server.lookup_component("announcements")
         announcements.register_feed("spoolman")
+        self.history_tracker = SpoolHistory(self)
+        history: History = self.server.load_component(config, "history")
+        history.register_auxiliary_field(self.history_tracker)
         self._register_notifications()
         self._register_listeners()
         self._register_endpoints()
@@ -124,6 +122,7 @@ class SpoolManager:
         self.server.send_event(
             "spoolman:active_spool_set", {"spool_id": spool_id}
         )
+        self.history_tracker.add_spool(spool_id)
         logging.info(f"Setting active spool to: {spool_id}")
 
     async def track_filament_usage(self):
@@ -156,6 +155,9 @@ class SpoolManager:
 
                 self.has_printed_error_since_last_down = False
                 self.extruded = 0
+
+    def get_active_spool(self) -> Optional[int]:
+        return self.spool_id
 
     async def _handle_spool_id_request(self, web_request: WebRequest):
         if web_request.get_request_type() == RequestType.POST:
@@ -199,6 +201,26 @@ class SpoolManager:
 
         return response.json()
 
+class SpoolHistory(HistoryField):
+    def __init__(self, spool_manager: SpoolManager) -> None:
+        super().__init__("spool_ids", None, "List of Spool IDs used during print")
+        self.spool_manager = spool_manager
+        self.spool_ids: List[int] = []
+
+    def add_spool(self, new_id: Optional[int]) -> None:
+        if new_id is not None and new_id not in self.spool_ids:
+            self.spool_ids.append(new_id)
+
+    def on_job_start(self) -> List[int]:
+        self.spool_ids.clear()
+        current_id = self.spool_manager.get_active_spool()
+        self.add_spool(current_id)
+        return self.spool_ids
+
+    def on_job_finished(self) -> List[int]:
+        current_id = self.spool_manager.get_active_spool()
+        self.add_spool(current_id)
+        return self.spool_ids
 
 def load_component(config: ConfigHelper) -> SpoolManager:
     return SpoolManager(config)
