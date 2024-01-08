@@ -1680,7 +1680,7 @@ gcode:
 
 To power on a device after an upload, `queue_gcode_uploads: True` must
 be set in the `[file_manager]`, `load_on_startup: True` must be set in
-`[job_queue]` and `one_when_job_queued: True` must be set in `[power dev_name]`,
+`[job_queue]` and `on_when_job_queued: True` must be set in `[power dev_name]`,
 where "dev_name" the the name of your power device.  For example:
 
 ```ini
